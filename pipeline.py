@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Transport Fever 2 Dynamic Map Analysis, Network Design & Optimization Framework
-Exports SVG outputs for Passenger, Cargo, and Combined networks.
-Also injects native Inkscape layers into the original SVG map export.
+Transport Fever 2 Dynamic Map Analysis, Network Design & Optimization Framework.
+Consumes vector map exports produced by Cartograph (TPF2 Vector Map Exporter mod by Aadit Jha:
+https://github.com/AaditJha/Tpf2MapExporter).
+
+Exports SVG outputs for Passenger, Cargo, Combined, and Schematic MRT networks.
+Also injects native Inkscape layers into the original Cartograph SVG map export.
 """
 
 import argparse
@@ -218,7 +221,11 @@ def compute_normal_offsets(pts, offset_dist):
 
 
 class MapNetworkPlanner:
-    """Dynamic network planner for Transport Fever 2 maps with SVG and PNG export."""
+    """Dynamic network planner for Transport Fever 2 maps with SVG and PNG export.
+    
+    Parses vector map exports produced by the Cartograph mod (vectormapexporter_1),
+    extracting layers: relief, towns, industries, rail, stations, contours, and coastline.
+    """
     
     def __init__(self, svg_path, custom_chains=None):
         self.svg_path = Path(svg_path)
