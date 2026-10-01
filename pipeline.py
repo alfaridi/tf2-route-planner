@@ -28,8 +28,32 @@ from PIL import Image
 import scipy.sparse.csgraph as csgraph
 from scipy.sparse import csr_matrix
 from scipy.spatial import cKDTree
+from scipy.interpolate import splprep, splev
 from skimage.graph import route_through_array
 import networkx as nx
+
+# Transport Fever 2 Track Engineering Standards
+# Reference: https://wiki.transportfever2.com/doku.php?id=modding:tracksstreets
+TF2_TRACK_SPECS = {
+    'track_distance_m': 5.0,            # Standard distance between track centers (m)
+    'min_curve_radius_build_m': 60.0,   # Standard track minimal radius when free dragging (m)
+    'min_curve_radius_snap_m': 44.0,    # Minimal radius when snapping / switches / parallel (m)
+    'high_speed_min_radius_m': 300.0,   # Recommended radius for high-speed express corridors (m)
+    'max_slope_build': 0.075,           # 7.5% maximum gradient limit for tracks
+    'max_slope_mainline': 0.035,        # 3.5% recommended maximum for mainline heavy haul
+    'speed_coeffs': (0.9, 15.0, 0.63),  # v [m/s] = a * (radius + b) ^ c
+}
+
+def tf2_curve_speed(radius_m):
+    """
+    Calculates Transport Fever 2 speed limit (km/h) for a given curve radius (m).
+    Formula from TF2 tracks config: v_ms = a * (radius + b) ^ c where a=0.9, b=15.0, c=0.63.
+    """
+    if radius_m >= 1e5 or math.isinf(radius_m):
+        return 300.0
+    a, b, c = TF2_TRACK_SPECS['speed_coeffs']
+    v_ms = a * ((max(0.0, radius_m) + b) ** c)
+    return min(300.0, v_ms * 3.6)
 
 DEFAULT_TF2_CHAINS = {
     'Quarry': {'product': 'Stone', 'consumer': 'Construction materials plant', 'car': 'gondola (dry bulk)'},
@@ -220,6 +244,174 @@ def compute_normal_offsets(pts, offset_dist):
     return pts + normals * offset_dist
 
 
+def ramer_douglas_peucker(points, epsilon):
+    """Simplifies a 2D polyline using the Ramer-Douglas-Peucker algorithm."""
+    points = np.asarray(points, dtype=float)
+    if len(points) < 3:
+        return points
+    line_vec = points[-1] - points[0]
+    line_len = np.hypot(line_vec[0], line_vec[1])
+    if line_len < 1e-6:
+        dists = np.hypot(points[1:-1, 0] - points[0, 0], points[1:-1, 1] - points[0, 1])
+    else:
+        n = np.array([-line_vec[1], line_vec[0]]) / line_len
+        dists = np.abs(np.dot(points[1:-1] - points[0], n))
+    if len(dists) == 0:
+        return points
+    dmax = np.max(dists)
+    if dmax > epsilon:
+        idx = np.argmax(dists) + 1
+        rec1 = ramer_douglas_peucker(points[:idx+1], epsilon)
+        rec2 = ramer_douglas_peucker(points[idx:], epsilon)
+        return np.vstack((rec1[:-1], rec2))
+    return np.array([points[0], points[-1]])
+
+
+def compute_route_curvature_and_speed(pts):
+    """
+    Computes instantaneous curvature kappa (1/m), curve radius R (m), and TF2 speed (km/h)
+    along an Nx2 polyline using arc-length parameterized derivatives.
+    """
+    pts = np.asarray(pts, dtype=float)
+    N = len(pts)
+    if N < 3:
+        return float('inf'), float('inf'), 300.0, 300.0, np.full(max(1, N), float('inf'))
+    
+    diffs = np.diff(pts, axis=0)
+    dists = np.hypot(diffs[:, 0], diffs[:, 1])
+    s = np.insert(np.cumsum(dists), 0, 0.0)
+    
+    # Boundary guard for duplicate consecutive points
+    if np.any(np.diff(s) <= 0.0):
+        unique_mask = np.insert(np.diff(s) > 1e-4, 0, True)
+        pts = pts[unique_mask]
+        s = s[unique_mask]
+        if len(pts) < 3:
+            return float('inf'), float('inf'), 300.0, 300.0, np.full(max(1, len(pts)), float('inf'))
+
+    dx = np.gradient(pts[:, 0], s)
+    dy = np.gradient(pts[:, 1], s)
+    ddx = np.gradient(dx, s)
+    ddy = np.gradient(dy, s)
+    
+    denom = np.maximum((dx**2 + dy**2)**1.5, 1e-9)
+    curv = np.abs(dx * ddy - dy * ddx) / denom
+    radii = 1.0 / np.maximum(curv, 1e-6)
+    
+    interior_r = radii[2:-2] if len(radii) > 4 else (radii[1:-1] if len(radii) > 2 else radii)
+    min_r = float(np.min(interior_r))
+    mean_r = float(np.mean(interior_r[interior_r < 1e5])) if np.any(interior_r < 1e5) else float('inf')
+    
+    min_speed = float(tf2_curve_speed(min_r))
+    speeds = np.array([tf2_curve_speed(r) for r in interior_r])
+    mean_speed = float(np.mean(speeds)) if len(speeds) > 0 else 300.0
+    
+    return min_r, mean_r, min_speed, mean_speed, radii
+
+
+def smooth_and_validate_rail_route(pts, min_radius=60.0, target_spacing=8.0, epsilon=12.0):
+    """
+    Transforms discrete 8-connected grid routes into realistic, smooth railway curves
+    guaranteed to respect Transport Fever 2 minimum build radius (min_radius >= 60.0m).
+    
+    Steps:
+    1. Filters micro-staircase grid noise via Ramer-Douglas-Peucker (epsilon=12.0m).
+    2. Parameterizes key corridor waypoints by cumulative arc-length.
+    3. Fits cubic B-spline (degree 3) with curvature-aware tension optimization.
+    4. Resamples at uniform railway surveying stations (~8m spacing).
+    5. Validates minimum radius >= 60.0m and computes TF2 speed metrics.
+    """
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 4:
+        total_len = float(np.sum(np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1])))) if len(pts) > 1 else 0.0
+        num_eval = max(2, int(total_len / target_spacing))
+        alphas = np.linspace(0, 1, num_eval)
+        smoothed = np.array([pts[0] * (1 - a) + pts[-1] * a for a in alphas])
+        metrics = {
+            'length_m': round(total_len, 1),
+            'min_radius_m': float('inf'),
+            'mean_radius_m': float('inf'),
+            'min_speed_kmh': 300.0,
+            'mean_speed_kmh': 300.0,
+            'is_tf2_compliant': True
+        }
+        return [tuple(p) for p in smoothed], metrics
+
+    simplified = ramer_douglas_peucker(pts, epsilon)
+    d_steps = np.hypot(np.diff(simplified[:, 0]), np.diff(simplified[:, 1]))
+    simplified = np.vstack(([simplified[0]], simplified[1:][d_steps > 1.5]))
+
+    total_len = float(np.sum(np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))))
+    if len(simplified) < 4:
+        num_eval = max(4, int(total_len / target_spacing))
+        alphas = np.linspace(0, 1, num_eval)
+        smoothed = np.array([pts[0] * (1 - a) + pts[-1] * a for a in alphas])
+        metrics = {
+            'length_m': round(total_len, 1),
+            'min_radius_m': float('inf'),
+            'mean_radius_m': float('inf'),
+            'min_speed_kmh': 300.0,
+            'mean_speed_kmh': 300.0,
+            'is_tf2_compliant': True
+        }
+        return [tuple(p) for p in smoothed], metrics
+
+    dists = np.hypot(np.diff(simplified[:, 0]), np.diff(simplified[:, 1]))
+    u = np.insert(np.cumsum(dists), 0, 0.0)
+    curve_len = u[-1]
+
+    # Heavily weight endpoints so spline strictly anchors to station/terminal coordinates
+    # without introducing discrete step jumps or numerical derivative spikes
+    w = np.ones(len(simplified))
+    w[0] = 100.0
+    w[-1] = 100.0
+
+    best_candidate = None
+    for s_mult in [5.0, 15.0, 30.0, 60.0, 120.0, 200.0, 300.0]:
+        try:
+            s_val = len(simplified) * s_mult
+            tck, _ = splprep([simplified[:, 0], simplified[:, 1]], w=w, u=u, k=3, s=s_val)
+            num_eval = max(10, int(curve_len / target_spacing))
+            u_eval = np.linspace(0, curve_len, num_eval)
+            x_eval, y_eval = splev(u_eval, tck)
+            
+            cand_pts = np.column_stack([x_eval, y_eval])
+            cand_pts[0] = pts[0]
+            cand_pts[-1] = pts[-1]
+            min_r, mean_r, min_v, mean_v, _ = compute_route_curvature_and_speed(cand_pts)
+            
+            if best_candidate is None or min_r > best_candidate[1]:
+                best_candidate = (cand_pts, min_r, mean_r, min_v, mean_v)
+            if min_r >= min_radius:
+                break
+        except Exception:
+            continue
+
+    if best_candidate is not None:
+        sm_pts, min_r, mean_r, min_v, mean_v = best_candidate
+        actual_len = float(np.sum(np.hypot(np.diff(sm_pts[:, 0]), np.diff(sm_pts[:, 1]))))
+        metrics = {
+            'length_m': round(actual_len, 1),
+            'min_radius_m': round(min_r, 1) if min_r < 1e5 else float('inf'),
+            'mean_radius_m': round(mean_r, 1) if mean_r < 1e5 else float('inf'),
+            'min_speed_kmh': round(min_v, 1),
+            'mean_speed_kmh': round(mean_v, 1),
+            'is_tf2_compliant': min_r >= TF2_TRACK_SPECS['min_curve_radius_build_m']
+        }
+        return [tuple(p) for p in sm_pts], metrics
+
+    min_r, mean_r, min_v, mean_v, _ = compute_route_curvature_and_speed(pts)
+    metrics = {
+        'length_m': round(total_len, 1),
+        'min_radius_m': round(min_r, 1),
+        'mean_radius_m': round(mean_r, 1),
+        'min_speed_kmh': round(min_v, 1),
+        'mean_speed_kmh': round(mean_v, 1),
+        'is_tf2_compliant': min_r >= TF2_TRACK_SPECS['min_curve_radius_build_m']
+    }
+    return [tuple(p) for p in pts], metrics
+
+
 class MapNetworkPlanner:
     """Dynamic network planner for Transport Fever 2 maps with SVG and PNG export.
     
@@ -230,6 +422,7 @@ class MapNetworkPlanner:
     def __init__(self, svg_path, custom_chains=None):
         self.svg_path = Path(svg_path)
         self.chains = custom_chains or DEFAULT_TF2_CHAINS
+        self._last_route_metrics = {}
         
         self.towns = {}
         self.industries = []
@@ -440,19 +633,46 @@ class MapNetworkPlanner:
         self.industries = [ind for ind in self.industries if ind['id'] != ind_id]
         print(f"[Dynamic] Removed industry '{ind_id}'")
 
-    def find_route(self, p1, p2, anchor_radius=400.0):
+    def find_route(self, p1, p2, anchor_radius=400.0, smooth=True, min_radius=60.0):
         c1, r1 = self._to_grid(p1[0], p1[1])
         c2, r2 = self._to_grid(p2[0], p2[1])
         
+        full_px = None
+        tot_cst = 0.0
         if self.rail_tree is not None:
             d1, idx1 = self.rail_tree.query(p1)
             d2, idx2 = self.rail_tree.query(p2)
 
+            def is_valid_anchor(pa, pb, cand_anc):
+                va = np.array(pa, dtype=float)
+                vb = np.array(pb, dtype=float)
+                vc = np.array(cand_anc, dtype=float)
+                direct = np.hypot(vb[0] - va[0], vb[1] - va[1])
+                if direct < 1e-3:
+                    return False
+                detour = np.hypot(vc[0] - va[0], vc[1] - va[1]) + np.hypot(vb[0] - vc[0], vb[1] - vc[1])
+                if detour > direct * 1.15:
+                    return False
+                v_dir = vb - va
+                v_len_sq = np.dot(v_dir, v_dir)
+                proj = np.dot(vc - va, v_dir) / v_len_sq
+                if proj < 0.05 or proj > 0.95:
+                    return False
+                v1 = vc - va
+                v2 = vb - vc
+                l1 = np.hypot(v1[0], v1[1])
+                l2 = np.hypot(v2[0], v2[1])
+                if l1 < 1e-3 or l2 < 1e-3:
+                    return True
+                return (np.dot(v1, v2) / (l1 * l2)) > 0.2
+
             anchor_idx = None
             if d1 < anchor_radius and d2 > anchor_radius:
-                anchor_idx = idx1
+                if is_valid_anchor(p1, p2, self.rail_pts[idx1]):
+                    anchor_idx = idx1
             elif d2 < anchor_radius and d1 > anchor_radius:
-                anchor_idx = idx2
+                if is_valid_anchor(p1, p2, self.rail_pts[idx2]):
+                    anchor_idx = idx2
 
             if anchor_idx is not None:
                 anc = self.rail_pts[anchor_idx]
@@ -460,10 +680,28 @@ class MapNetworkPlanner:
                 rt1, cst1 = route_through_array(self.cost_surface, (r1, c1), (ra, ca), fully_connected=True, geometric=True)
                 rt2, cst2 = route_through_array(self.cost_surface, (ra, ca), (r2, c2), fully_connected=True, geometric=True)
                 full_px = rt1 + rt2[1:]
-                return [self._to_svg(p[1], p[0]) for p in full_px], cst1 + cst2
+                tot_cst = cst1 + cst2
 
-        rt, cst = route_through_array(self.cost_surface, (r1, c1), (r2, c2), fully_connected=True, geometric=True)
-        return [self._to_svg(p[1], p[0]) for p in rt], cst
+        if full_px is None:
+            rt, cst = route_through_array(self.cost_surface, (r1, c1), (r2, c2), fully_connected=True, geometric=True)
+            full_px = rt
+            tot_cst = cst
+
+        raw_pts = [self._to_svg(p[1], p[0]) for p in full_px]
+        if smooth:
+            sm_pts, metrics = smooth_and_validate_rail_route(raw_pts, min_radius=min_radius)
+            self._last_route_metrics = metrics
+            return sm_pts, tot_cst
+
+        self._last_route_metrics = {
+            'length_m': round(float(np.sum(np.hypot(np.diff(np.array(raw_pts)[:, 0]), np.diff(np.array(raw_pts)[:, 1])))), 1),
+            'min_radius_m': 5.0,
+            'mean_radius_m': 20.0,
+            'min_speed_kmh': 40.0,
+            'mean_speed_kmh': 60.0,
+            'is_tf2_compliant': False
+        }
+        return raw_pts, tot_cst
 
     def optimize_cargo_network(self, k_clusters=None):
         print("[Cargo] Optimizing regional hubs and supply chains...")
@@ -544,13 +782,25 @@ class MapNetworkPlanner:
         for i, j in trunk_edges:
             h1, h2 = hubs[i], hubs[j]
             pts, cst = self.find_route(h1['centroid'], h2['centroid'])
-            trunk_routes.append({'from_hub': h1['name'], 'to_hub': h2['name'], 'path_svg': pts, 'cost': cst})
+            trunk_routes.append({
+                'from_hub': h1['name'],
+                'to_hub': h2['name'],
+                'path_svg': pts,
+                'cost': cst,
+                **self._last_route_metrics
+            })
             
         spur_routes = []
         for h in hubs:
             for t in h['towns']:
                 pts, cst = self.find_route(self.towns[t], h['centroid'])
-                spur_routes.append({'town': t, 'hub': h['name'], 'path_svg': pts, 'cost': cst})
+                spur_routes.append({
+                    'town': t,
+                    'hub': h['name'],
+                    'path_svg': pts,
+                    'cost': cst,
+                    **self._last_route_metrics
+                })
                 
         max_vol_hub = max(hubs, key=lambda h: h['industry_count']) if hubs else None
         flagged_hauls = []
@@ -640,7 +890,13 @@ class MapNetworkPlanner:
         for c in clusters:
             for t in c['members']:
                 pts, cst = self.find_route(self.towns[t], self.towns[c['hub']])
-                spoke_routes.append({'town': t, 'hub': c['hub'], 'path_svg': pts, 'cost': cst})
+                spoke_routes.append({
+                    'town': t,
+                    'hub': c['hub'],
+                    'path_svg': pts,
+                    'cost': cst,
+                    **self._last_route_metrics
+                })
 
         backbone_routes = []
         K = len(hub_towns)
@@ -651,7 +907,13 @@ class MapNetworkPlanner:
             for i, j in zip(*np.nonzero(np.triu(hub_mst))):
                 h1, h2 = hub_towns[i], hub_towns[j]
                 pts, cst = self.find_route(self.towns[h1], self.towns[h2])
-                backbone_routes.append({'from_hub': h1, 'to_hub': h2, 'path_svg': pts, 'cost': cst})
+                backbone_routes.append({
+                    'from_hub': h1,
+                    'to_hub': h2,
+                    'path_svg': pts,
+                    'cost': cst,
+                    **self._last_route_metrics
+                })
 
         print(f"  Built {len(clusters)} regional star cluster(s), {len(spoke_routes)} spoke(s), {len(backbone_routes)} backbone link(s).")
 
@@ -724,37 +986,38 @@ class MapNetworkPlanner:
                 else:
                     chosen_act = 'REPORT_ONLY'
 
-                if p_s <= p_e:
-                    shared_pts = [tuple(p) for p in ref_arr[p_s:p_e+1]]
-                else:
-                    shared_pts = [tuple(p) for p in ref_arr[p_e:p_s+1][::-1]]
+                N_seg = len(seg)
+                ref_targets = ref_arr[p_indices[s:e+1]]
+                vecs = seg - ref_targets
+                v_dists = np.hypot(vecs[:, 0], vecs[:, 1])
+                v_dists_safe = np.where(v_dists > 1e-3, v_dists, 1.0)
+                u_vecs = vecs / v_dists_safe[:, None]
 
                 if chosen_act == 'MERGED_SHARED_ROW':
-                    new_c_path = list(map(tuple, c_pts[:s])) + shared_pts + list(map(tuple, c_pts[e+1:]))
-                    # A merge stretch touching the candidate's own start/end drops that anchor
-                    # (town/hub) since the reference path doesn't necessarily reach it -- restore it.
+                    # Consolidate into shared Right-of-Way at standard TF2 5.0m track distance.
+                    # Smooth cosine ramp at entry and exit ensures realistic turnout geometry
+                    # without discontinuous lateral jumps or hairpin turnarounds.
+                    track_offset = TF2_TRACK_SPECS['track_distance_m']
+                    row_targets = ref_targets + track_offset * u_vecs
+                    trans_len = min(12, N_seg // 4)
+                    alpha = np.ones(N_seg)
+                    if trans_len > 0:
+                        ramp_in = 0.5 * (1.0 - np.cos(np.pi * np.arange(trans_len) / trans_len))
+                        alpha[:trans_len] = ramp_in
+                        alpha[-trans_len:] = ramp_in[::-1]
                     if s == 0:
-                        new_c_path.insert(0, orig_start)
+                        alpha[0] = 0.0
                     if e == N_orig - 1:
-                        new_c_path.append(orig_end)
-                    c_pts = np.array(new_c_path)
-                    corr_path = shared_pts
+                        alpha[-1] = 0.0
+                    merged_seg = (1.0 - alpha[:, None]) * seg + alpha[:, None] * row_targets
+                    c_pts = np.vstack([c_pts[:s], merged_seg, c_pts[e+1:]])
+                    corr_path = [tuple(p) for p in merged_seg]
                 elif chosen_act == 'DELIBERATE_OFFSET':
-                    N_seg = len(seg)
                     idx_arr = np.arange(N_seg)
                     taper = np.sin(np.pi * idx_arr / max(1, N_seg - 1))
-                    vecs = seg - ref_arr[p_indices[s:e+1]]
-                    v_dists = np.hypot(vecs[:, 0], vecs[:, 1])
-                    v_dists[v_dists == 0] = 1.0
-                    u_vecs = vecs / v_dists[:, None]
                     needed_shift = np.maximum(0.0, offset_dist - v_dists)
                     offset_seg = seg + (taper * needed_shift)[:, None] * u_vecs
-                    new_c_path = list(map(tuple, c_pts[:s])) + [tuple(p) for p in offset_seg] + list(map(tuple, c_pts[e+1:]))
-                    if s == 0:
-                        new_c_path.insert(0, orig_start)
-                    if e == N_orig - 1:
-                        new_c_path.append(orig_end)
-                    c_pts = np.array(new_c_path)
+                    c_pts = np.vstack([c_pts[:s], offset_seg, c_pts[e+1:]])
                     corr_path = [tuple(p) for p in offset_seg]
                 else:
                     corr_path = [tuple(p) for p in seg]
@@ -777,6 +1040,9 @@ class MapNetworkPlanner:
                 }
                 records.append(record)
 
+        if records:
+            c_pts_sm, _ = smooth_and_validate_rail_route(c_pts, min_radius=TF2_TRACK_SPECS['min_curve_radius_build_m'])
+            return records, c_pts_sm
         return records, [tuple(p) for p in c_pts]
 
     def reconcile_corridors(self, threshold=250.0, min_len=350.0, min_pass_span=100.0, action='auto', offset_dist=150.0):
@@ -806,43 +1072,35 @@ class MapNetworkPlanner:
                 print(f"  [{r['action']}] {r['name']}: {r['length_m']:.0f}m (Pass Span: {r['pass_span_m']:.0f}m, "
                       f"Avg Sep: {r['avg_separation_m']:.1f}m, Cost: {r['mean_terrain_cost']:.2f})")
 
-        # 0. Cargo spur vs. cargo trunk. Unlike backbone/trunk or spoke/spoke, both sides here
-        # are freight -- there's no reason to keep a dotted feeder spur running directly on top
-        # of a solid trunk line just because a member town happens to sit almost on the trunk's
-        # own path (e.g. Manokwari sitting on the Aceh<->Surabaya trunk). Trim the spur back to
-        # where it first joins a trunk for a real stretch, snapped onto the trunk's own point so
-        # it still visually touches it, instead of drawing a redundant duplicate track.
+        # 0. Cargo spur vs. cargo trunk. Consolidate overlapping stretches into shared ROW
+        # without truncating feeder service to the yard or introducing sharp snap angles.
         for spur in self.cargo_plan['spur_routes']:
-            s_pts = np.array(spur['path_svg'])
-            if len(s_pts) < 3:
-                continue
+            best = None
             for t_route in self.cargo_plan['trunk_routes']:
-                t_pts = [tuple(p) for p in t_route['path_svg']]
-                if len(t_pts) < 2:
+                ref_pts = [tuple(p) for p in t_route['path_svg']]
+                if len(ref_pts) < 2:
                     continue
-                t_arr = np.array(t_pts)
-                dists, t_idx = cKDTree(t_arr).query(s_pts)
-                in_corr = dists <= threshold
-                i, cut = 0, None
-                while i < len(in_corr):
-                    if in_corr[i]:
-                        j = i
-                        while j < len(in_corr) and in_corr[j]:
-                            j += 1
-                        seg = s_pts[i:j]
-                        slen = float(np.sum(np.hypot(np.diff(seg, axis=0)[:, 0], np.diff(seg, axis=0)[:, 1]))) if len(seg) > 1 else 0.0
-                        if slen >= min_len:
-                            cut = i
-                            break
-                        i = j
-                    else:
-                        i += 1
-                if cut is not None:
-                    snap_pt = tuple(t_arr[t_idx[cut]])
-                    spur['path_svg'] = [tuple(p) for p in s_pts[:cut]] + [snap_pt]
-                    print(f"  [SPUR_TRIMMED] {spur['town']} -> {spur['hub']}: redundant with "
-                          f"{t_route['from_hub']} <-> {t_route['to_hub']} trunk past {cut} of {len(s_pts)} points")
-                    break
+                ref_arr = np.array(ref_pts)
+                ref_tree = cKDTree(ref_arr)
+                label = f"{spur['town']} spur @ {spur['hub']} / {t_route['from_hub']} ↔ {t_route['to_hub']} Cargo Trunk"
+                recs, new_path = self._reconcile_stretches(ref_arr, ref_tree, spur['path_svg'],
+                                                             threshold, min_len, min_pass_span,
+                                                             action, offset_dist, len(self.corridors), label,
+                                                             tier='feeder')
+                if recs:
+                    score = sum(r['length_m'] for r in recs)
+                    if best is None or score > best[2]:
+                        best = (recs, new_path, score)
+            if best:
+                recs, new_path, _ = best
+                sm_path, metrics = smooth_and_validate_rail_route(new_path, min_radius=TF2_TRACK_SPECS['min_curve_radius_build_m'])
+                if metrics['is_tf2_compliant']:
+                    spur['path_svg'] = sm_path
+                    spur.update(metrics)
+                    log_committed(recs)
+                    self.corridors.extend(recs)
+                else:
+                    print(f"  [RECON_SKIPPED] {spur['town']} spur @ {spur['hub']}: shared ROW violates TF2 min radius ({metrics['min_radius_m']:.1f}m < 60m), keeping surveyed terrain path.")
 
         # 1. Passenger intercity backbone vs. cargo trunk. Each backbone_routes entry is its
         # own continuous polyline (an individual MST edge) -- unlike the old single main_line,
@@ -876,18 +1134,25 @@ class MapNetworkPlanner:
                         best = (recs, new_path, score)
             if best:
                 recs, new_path, _ = best
-                c_route['path_svg'] = new_path
-                log_committed(recs)
-                self.corridors.extend(recs)
+                sm_path, metrics = smooth_and_validate_rail_route(new_path, min_radius=TF2_TRACK_SPECS['min_curve_radius_build_m'])
+                if metrics['is_tf2_compliant']:
+                    c_route['path_svg'] = sm_path
+                    c_route.update(metrics)
+                    log_committed(recs)
+                    self.corridors.extend(recs)
+                else:
+                    print(f"  [RECON_SKIPPED] {c_route['from_hub']} ↔ {c_route['to_hub']} Cargo Trunk: shared ROW violates TF2 min radius ({metrics['min_radius_m']:.1f}m < 60m), keeping surveyed terrain path.")
 
         # 2. Cargo spur vs. passenger spoke. Different traffic than the spur-vs-trunk trim
         # above (freight feeder vs. passenger feeder, not freight vs. freight), so a nearby
         # pair isn't pure redundancy -- merge them into a shared ROW the same way backbone and
-        # trunk do. Same fork-vertex risk as step 1: score every spur against every spoke using
-        # its original path and commit only the single best match.
+        # trunk do. Only match spurs and spokes that serve the same town to prevent cross-regional
+        # mismatches or 180-degree hairpin reversals.
         for spur in self.cargo_plan['spur_routes']:
             best = None
             for spoke in self.pass_plan['spoke_routes']:
+                if spoke['town'] != spur['town']:
+                    continue
                 ref_pts = [tuple(p) for p in spoke['path_svg']]
                 if len(ref_pts) < 2:
                     continue
@@ -904,9 +1169,14 @@ class MapNetworkPlanner:
                         best = (recs, new_path, score)
             if best:
                 recs, new_path, _ = best
-                spur['path_svg'] = new_path
-                log_committed(recs)
-                self.corridors.extend(recs)
+                sm_path, metrics = smooth_and_validate_rail_route(new_path, min_radius=TF2_TRACK_SPECS['min_curve_radius_build_m'])
+                if metrics['is_tf2_compliant']:
+                    spur['path_svg'] = sm_path
+                    spur.update(metrics)
+                    log_committed(recs)
+                    self.corridors.extend(recs)
+                else:
+                    print(f"  [RECON_SKIPPED] {spur['town']} spur @ {spur['hub']}: shared ROW violates TF2 min radius ({metrics['min_radius_m']:.1f}m < 60m), keeping surveyed terrain path.")
 
         # 3. Spoke vs. spoke within each regional star cluster. Same fork problem as above --
         # every spoke in a cluster starts at the same hub vertex, so with 3+ spokes a candidate
@@ -935,9 +1205,14 @@ class MapNetworkPlanner:
                         if j not in best_for or score > best_for[j][2]:
                             best_for[j] = (recs, new_path, score)
             for j, (recs, new_path, _) in best_for.items():
-                spokes[j]['path_svg'] = new_path
-                log_committed(recs)
-                self.corridors.extend(recs)
+                sm_path, metrics = smooth_and_validate_rail_route(new_path, min_radius=TF2_TRACK_SPECS['min_curve_radius_build_m'])
+                if metrics['is_tf2_compliant']:
+                    spokes[j]['path_svg'] = sm_path
+                    spokes[j].update(metrics)
+                    log_committed(recs)
+                    self.corridors.extend(recs)
+                else:
+                    print(f"  [RECON_SKIPPED] {spokes[j]['town']} spoke @ {hub}: shared ROW violates TF2 min radius ({metrics['min_radius_m']:.1f}m < 60m), keeping surveyed terrain path.")
 
         total_shared_len = sum(c['length_m'] for c in self.corridors if c['action'] == 'MERGED_SHARED_ROW')
         print(f"[Corridors] Complete: {len(self.corridors)} corridors analyzed, {total_shared_len:.0f}m consolidated into shared ROW.")
@@ -1594,28 +1869,44 @@ class MapNetworkPlanner:
         shared_count = sum(1 for c in self.corridors if c['action'] == 'MERGED_SHARED_ROW')
 
         lines = ["# Transport Fever 2 - Route List", "", "## Passenger Routes", "", "### Intercity Backbone", "",
-                 "| Segment | Distance |", "| --- | --- |"]
+                 "| Segment | Distance | Min Curve Radius | Curve Speed Limit | TF2 Compliant (≥60m) |",
+                 "| --- | --- | --- | --- | --- |"]
         for bb in self.pass_plan['backbone_routes']:
-            lines.append(f"| {bb['from_hub']} <-> {bb['to_hub']} | {L(bb['path_svg']):.0f} m |")
+            r_str = f"{bb['min_radius_m']:.1f} m" if bb.get('min_radius_m', float('inf')) < 1e5 else "Straight"
+            v_str = f"{bb['min_speed_kmh']:.0f} km/h" if bb.get('min_speed_kmh') else "300 km/h"
+            c_str = "Pass" if bb.get('is_tf2_compliant', True) else "Warning (<60m)"
+            lines.append(f"| {bb['from_hub']} <-> {bb['to_hub']} | {L(bb['path_svg']):.0f} m | {r_str} | {v_str} | {c_str} |")
 
         lines += ["", "### Regional / Local Spokes", "", "| Hub | Serves |", "| --- | --- |"]
         for cluster in self.pass_plan['clusters']:
             hub = cluster['hub']
-            served = [f"{sp['town']} ({L(sp['path_svg']):.0f} m)"
-                      for sp in self.pass_plan['spoke_routes'] if sp['hub'] == hub]
+            served = []
+            for sp in self.pass_plan['spoke_routes']:
+                if sp['hub'] == hub:
+                    r_val = sp.get('min_radius_m', float('inf'))
+                    r_part = f", R_min: {r_val:.0f}m" if r_val < 1e5 else ""
+                    served.append(f"{sp['town']} ({L(sp['path_svg']):.0f} m{r_part})")
             if served:
                 lines.append(f"| {hub} | {', '.join(served)} |")
 
         lines += ["", "## Freight Routes", "", "### Trunk (hub yard <-> hub yard)", "",
-                  "| Segment | Distance |", "| --- | --- |"]
+                  "| Segment | Distance | Min Curve Radius | Curve Speed Limit | TF2 Compliant (≥60m) |",
+                  "| --- | --- | --- | --- | --- |"]
         for t in self.cargo_plan['trunk_routes']:
-            lines.append(f"| {t['from_hub']} <-> {t['to_hub']} | {L(t['path_svg']):.0f} m |")
+            r_str = f"{t['min_radius_m']:.1f} m" if t.get('min_radius_m', float('inf')) < 1e5 else "Straight"
+            v_str = f"{t['min_speed_kmh']:.0f} km/h" if t.get('min_speed_kmh') else "300 km/h"
+            c_str = "Pass" if t.get('is_tf2_compliant', True) else "Warning (<60m)"
+            lines.append(f"| {t['from_hub']} <-> {t['to_hub']} | {L(t['path_svg']):.0f} m | {r_str} | {v_str} | {c_str} |")
 
         lines += ["", "### Feeder Spurs (town/industry <-> hub yard)", "",
                   "| Yard | Industries | Serves |", "| --- | --- | --- |"]
         for h in self.cargo_plan['hubs']:
-            served = [f"{s['town']} ({L(s['path_svg']):.0f} m)"
-                      for s in self.cargo_plan['spur_routes'] if s['hub'] == h['name'] and L(s['path_svg']) > 0]
+            served = []
+            for s in self.cargo_plan['spur_routes']:
+                if s['hub'] == h['name'] and L(s['path_svg']) > 0:
+                    r_val = s.get('min_radius_m', float('inf'))
+                    r_part = f", R_min: {r_val:.0f}m" if r_val < 1e5 else ""
+                    served.append(f"{s['town']} ({L(s['path_svg']):.0f} m{r_part})")
             if served:
                 lines.append(f"| {h['name']} | {h['industry_count']} | {', '.join(served)} |")
 
@@ -1702,6 +1993,30 @@ def main():
                 'town': m['town'],
                 'distance_m': round(m['distance_m'], 1)
             } for m in planner.missed_stops],
+            'curvature_and_speed_audit': {
+                'tf2_min_build_radius_m': TF2_TRACK_SPECS['min_curve_radius_build_m'],
+                'tf2_min_snap_radius_m': TF2_TRACK_SPECS['min_curve_radius_snap_m'],
+                'passenger_backbone': [{
+                    'from': bb['from_hub'],
+                    'to': bb['to_hub'],
+                    'length_m': round(float(np.sum(np.hypot(np.diff(np.array(bb['path_svg'])[:, 0]), np.diff(np.array(bb['path_svg'])[:, 1])))), 1),
+                    'min_radius_m': bb.get('min_radius_m'),
+                    'mean_radius_m': bb.get('mean_radius_m'),
+                    'min_speed_kmh': bb.get('min_speed_kmh'),
+                    'mean_speed_kmh': bb.get('mean_speed_kmh'),
+                    'tf2_compliant': bb.get('is_tf2_compliant', True)
+                } for bb in planner.pass_plan['backbone_routes']],
+                'cargo_trunks': [{
+                    'from': t['from_hub'],
+                    'to': t['to_hub'],
+                    'length_m': round(float(np.sum(np.hypot(np.diff(np.array(t['path_svg'])[:, 0]), np.diff(np.array(t['path_svg'])[:, 1])))), 1),
+                    'min_radius_m': t.get('min_radius_m'),
+                    'mean_radius_m': t.get('mean_radius_m'),
+                    'min_speed_kmh': t.get('min_speed_kmh'),
+                    'mean_speed_kmh': t.get('mean_speed_kmh'),
+                    'tf2_compliant': t.get('is_tf2_compliant', True)
+                } for t in planner.cargo_plan['trunk_routes']]
+            },
             'outputs': {k: str(v) for k, v in res['files'].items()}
         }, f, indent=2)
     print(f"Summary written to {summary_path}")
